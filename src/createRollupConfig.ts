@@ -1,52 +1,60 @@
-import {
-  safeVariableName,
-  safePackageName,
-  resolveApp,
-  removeScope,
-  external,
-} from './utils';
+import { safeVariableName, safePackageName, external } from './utils';
 import { paths } from './constants';
-import { sizeSnapshot } from 'rollup-plugin-size-snapshot';
 import { terser } from 'rollup-plugin-terser';
-import babel from 'rollup-plugin-babel';
+import { DEFAULT_EXTENSIONS } from '@babel/core';
+// import babel from 'rollup-plugin-babel';
 import commonjs from 'rollup-plugin-commonjs';
 import json from 'rollup-plugin-json';
 import replace from 'rollup-plugin-replace';
 import resolve from 'rollup-plugin-node-resolve';
 import sourceMaps from 'rollup-plugin-sourcemaps';
 import typescript from 'rollup-plugin-typescript2';
-import shebangPlugin from '@jaredpalmer/rollup-plugin-preserve-shebang';
+import { extractErrors } from './errors/extractErrors';
+import { babelPluginTsdx } from './babelPluginTsdx';
+import { TsdxOptions } from './types';
 
-const replacements = [{ original: 'lodash', replacement: 'lodash-es' }];
-
-const babelOptions = {
-  exclude: /node_modules/,
-  plugins: [
-    require.resolve('babel-plugin-annotate-pure-calls'),
-    require.resolve('babel-plugin-dev-expression'),
-    [require.resolve('babel-plugin-transform-rename-import'), { replacements }],
-  ],
+const errorCodeOpts = {
+  errorMapFilePath: paths.appErrorsJson,
 };
 
-export function createRollupConfig(
-  format: 'cjs' | 'umd' | 'es',
-  env: 'development' | 'production',
-  opts: { input: string; name: string; target: 'node' | 'browser' }
-) {
-  let shebang;
+// shebang cache map thing because the transform only gets run once
+let shebang: any = {};
+
+export function createRollupConfig(opts: TsdxOptions) {
+  const findAndRecordErrorCodes = extractErrors({
+    ...errorCodeOpts,
+    ...opts,
+  });
+
+  const shouldMinify =
+    opts.minify !== undefined ? opts.minify : opts.env === 'production';
+
+  const outputName = [
+    `${paths.appDist}/${safePackageName(opts.name)}`,
+    opts.format,
+    opts.env,
+    shouldMinify ? 'min' : '',
+    'js',
+  ]
+    .filter(Boolean)
+    .join('.');
+
   return {
     // Tell Rollup the entry point to the package
     input: opts.input,
     // Tell Rollup which packages to ignore
-    external,
+    external: (id: string) => {
+      if (id === 'babel-plugin-transform-async-to-promises/helpers') {
+        return false;
+      }
+      return external(id);
+    },
     // Establish Rollup output
     output: {
       // Set filenames of the consumer's package
-      file: `${paths.appDist}/${safePackageName(
-        opts.name
-      )}.${format}.${env}.js`,
+      file: outputName,
       // Pass through the file format
-      format,
+      format: opts.format,
       // Do not let Rollup call Object.freeze() on namespace import objects
       // (i.e. import * as namespaceImportObject from...) that are accessed dynamically.
       freeze: false,
@@ -78,6 +86,12 @@ export function createRollupConfig(
       exports: 'named',
     },
     plugins: [
+      !!opts.extractErrors && {
+        transform(source: any) {
+          findAndRecordErrorCodes(source);
+          return source;
+        },
+      },
       resolve({
         mainFields: [
           'module',
@@ -85,15 +99,36 @@ export function createRollupConfig(
           opts.target !== 'node' ? 'browser' : undefined,
         ].filter(Boolean) as string[],
       }),
-      format === 'umd' &&
+      opts.format === 'umd' &&
         commonjs({
           // use a regex to make sure to include eventual hoisted packages
           include: /\/node_modules\//,
         }),
       json(),
+      {
+        // Custom plugin that removes shebang from code because newer
+        // versions of bublé bundle their own private version of `acorn`
+        // and I don't know a way to patch in the option `allowHashBang`
+        // to acorn. Taken from microbundle.
+        // See: https://github.com/Rich-Harris/buble/pull/165
+        transform(code: string) {
+          let reg = /^#!(.*)/;
+          let match = code.match(reg);
+
+          shebang[opts.name] = match ? '#!' + match[1] : '';
+
+          code = code.replace(reg, '');
+
+          return {
+            code,
+            map: null,
+          };
+        },
+      },
       typescript({
         typescript: require('typescript'),
-        cacheRoot: `./.rts2_cache_${format}`,
+        cacheRoot: `./.rts2_cache_${opts.format}`,
+        tsconfig: opts.tsconfig,
         tsconfigDefaults: {
           compilerOptions: {
             sourceMap: true,
@@ -107,30 +142,38 @@ export function createRollupConfig(
           },
         },
       }),
-      babel(babelOptions),
-      replace({
-        'process.env.NODE_ENV': JSON.stringify(env),
+      babelPluginTsdx({
+        exclude: 'node_modules/**',
+        extensions: [...DEFAULT_EXTENSIONS, 'ts', 'tsx'],
+        passPerPreset: true,
+        custom: {
+          targets: opts.target === 'node' ? { node: '8' } : undefined,
+          extractErrors: opts.extractErrors,
+          format: opts.format,
+          // defines: opts.defines,
+        },
       }),
+      opts.env !== undefined &&
+        replace({
+          'process.env.NODE_ENV': JSON.stringify(opts.env),
+        }),
       sourceMaps(),
-      sizeSnapshot({
-        printInfo: false,
-      }),
-      env === 'production' &&
+      // sizeSnapshot({
+      //   printInfo: false,
+      // }),
+      shouldMinify &&
         terser({
           sourcemap: true,
           output: { comments: false },
           compress: {
             keep_infinity: true,
             pure_getters: true,
-            collapse_vars: false,
+            passes: 10,
           },
           ecma: 5,
-          toplevel: format === 'es' || format === 'cjs',
+          toplevel: opts.format === 'cjs',
           warnings: true,
         }),
-      shebangPlugin({
-        shebang,
-      }),
     ],
   };
 }
